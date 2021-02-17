@@ -1,6 +1,8 @@
 from __future__ import absolute_import
 
 import random
+import numpy as np
+from typing import Any
 from warnings import warn
 
 import cv2
@@ -123,7 +125,7 @@ class BasicTransform:
         target_function = self.targets.get(transform_key, lambda x, **p: x)
         return target_function
 
-    def apply(self, img, **params):
+    def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
         raise NotImplementedError
 
     def get_params(self):

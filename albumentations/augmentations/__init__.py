@@ -15,4 +15,6 @@ from .geometric.rotate import *
 from .crops.transforms import *
 from .crops.functional import *
 
+from .pixel_level import *
+
 from .utils import *
