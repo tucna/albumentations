@@ -214,6 +214,7 @@ AUGMENTATION_CLS_PARAMS = [
     [A.SmallestMaxSize, {"max_size": 64, "interpolation": cv2.INTER_CUBIC}],
     [A.LongestMaxSize, {"max_size": 128, "interpolation": cv2.INTER_CUBIC}],
     [A.RandomGridShuffle, {"grid": (5, 5)}],
+    [A.UnpropShuffle, {"grid": (5, 5)}],
     [A.Solarize, {"threshold": 32}],
     [A.Posterize, {"num_bits": 1}],
     [A.Equalize, {"mode": "pil", "by_channels": False}],

@@ -6,6 +6,9 @@ from typing import Callable, Optional, Sequence, Union
 from warnings import warn
 
 import cv2
+from dataclasses import dataclass
+import random
+import copy
 import numpy as np
 import skimage
 
@@ -1120,6 +1123,276 @@ def from_float(img, dtype, max_value=None):
     return (img * max_value).astype(dtype)
 
 
+def bbox_vflip(bbox, rows, cols):  # skipcq: PYL-W0613
+    """Flip a bounding box vertically around the x-axis.
+
+    Args:
+        bbox (tuple): A bounding box `(x_min, y_min, x_max, y_max)`.
+        rows (int): Image rows.
+        cols (int): Image cols.
+
+    Returns:
+        tuple: A bounding box `(x_min, y_min, x_max, y_max)`.
+
+    """
+    x_min, y_min, x_max, y_max = bbox[:4]
+    return x_min, 1 - y_max, x_max, 1 - y_min
+
+
+def bbox_hflip(bbox, rows, cols):  # skipcq: PYL-W0613
+    """Flip a bounding box horizontally around the y-axis.
+
+    Args:
+        bbox (tuple): A bounding box `(x_min, y_min, x_max, y_max)`.
+        rows (int): Image rows.
+        cols (int): Image cols.
+
+    Returns:
+        tuple: A bounding box `(x_min, y_min, x_max, y_max)`.
+
+    """
+    x_min, y_min, x_max, y_max = bbox[:4]
+    return 1 - x_max, y_min, 1 - x_min, y_max
+
+
+def bbox_flip(bbox, d, rows, cols):
+    """Flip a bounding box either vertically, horizontally or both depending on the value of `d`.
+
+    Args:
+        bbox (tuple): A bounding box `(x_min, y_min, x_max, y_max)`.
+        d (int):
+        rows (int): Image rows.
+        cols (int): Image cols.
+
+    Returns:
+        tuple: A bounding box `(x_min, y_min, x_max, y_max)`.
+
+    Raises:
+        ValueError: if value of `d` is not -1, 0 or 1.
+
+    """
+    if d == 0:
+        bbox = bbox_vflip(bbox, rows, cols)
+    elif d == 1:
+        bbox = bbox_hflip(bbox, rows, cols)
+    elif d == -1:
+        bbox = bbox_hflip(bbox, rows, cols)
+        bbox = bbox_vflip(bbox, rows, cols)
+    else:
+        raise ValueError("Invalid d value {}. Valid values are -1, 0 and 1".format(d))
+    return bbox
+
+
+def unprop_bbox_transpose(in_boxes, tiles, shuffled_ids, rows, cols):
+
+    @dataclass
+    class Box:
+        x: float
+        y: float
+        width: float
+        height: float
+        cls: int
+        segmentID: int
+
+    boxes_split = []
+    boxes_list = []
+    boxes = []
+    classes = []
+
+    for b in in_boxes:
+        classes.append(b[4])
+
+    for b in in_boxes:
+        boxes.append([b[0], b[1], b[2], b[3]])
+
+    boxes = np.asarray(boxes)
+    classes = np.asarray(classes)
+
+    for b in range(boxes.shape[0]):
+        # y,x to x,y order
+
+        boxes[b, :2] = (boxes[b, :2] * (cols, rows))
+        boxes[b, 2:] = (boxes[b, 2:] * (cols, rows))
+
+        boxes_list.append(Box(boxes[b, 0], boxes[b, 1], boxes[b, 2] - boxes[b, 0], boxes[b, 3] - boxes[b, 1], classes[b], 0))
+        #boxes_list.append(
+        #    Box(boxes[b, 0], boxes[b, 1], boxes[b, 2], boxes[b, 3], 0, 0))
+
+    def change(i, j):
+        """Swaps boxes in i-th and j-th segment. Boxes are tored in split_objects."""
+
+        i_boxes_ids = []
+        j_boxes_ids = []
+        # find all boxes belonging to i-th and j-th segment.
+        for k in range(len(boxes_split)):
+            if boxes_split[k].segmentID == i:
+                i_boxes_ids.append(k)
+            if boxes_split[k].segmentID == j:
+                j_boxes_ids.append(k)
+
+        for i_box_id in i_boxes_ids:
+            # 0 => x, 1 => y, 2 => width, 3 => height
+            # normalize top left point in i-th coords and denormalize in j-th coord
+            boxes_split[i_box_id].x = ((boxes_split[i_box_id].x - tiles[i][0]) / tiles[i][2]) * tiles[j][2] + \
+                                      tiles[j][0]
+            boxes_split[i_box_id].y = ((boxes_split[i_box_id].y - tiles[i][1]) / tiles[i][3]) * tiles[j][3] + \
+                                      tiles[j][1]
+            # normalize width and height in i-th coords and denormalize in j-th coord
+            boxes_split[i_box_id].width = boxes_split[i_box_id].width / tiles[i][2] * tiles[j][2]
+            boxes_split[i_box_id].height = boxes_split[i_box_id].height / tiles[i][3] * tiles[j][3]
+            boxes_split[i_box_id].segmentID = j
+
+        for j_box_id in j_boxes_ids:
+            # normalize top left point in j-th coords and denormalize in i-th coord
+            boxes_split[j_box_id].x = ((boxes_split[j_box_id].x - tiles[j][0]) / tiles[j][2]) * tiles[i][2] + tiles[i][0]
+            boxes_split[j_box_id].y = ((boxes_split[j_box_id].y - tiles[j][1]) / tiles[j][3]) * tiles[i][3] + tiles[i][1]
+            # normalize width and height in j-th coords and denormalize in i-th coord
+            boxes_split[j_box_id].width = (boxes_split[j_box_id].width / tiles[j][2]) * tiles[i][2]
+            boxes_split[j_box_id].height = (boxes_split[j_box_id].height / tiles[j][3]) * tiles[i][3]
+            boxes_split[j_box_id].segmentID = i
+
+    def intersection_rect(a, b):
+        x = max(a[0], b.x)
+        y = max(a[1], b.y)
+        w = min(a[0] + a[2], b.x + b.width) - x
+        h = min(a[1] + a[3], b.y + b.height) - y
+
+        if w < 0 or h < 0:
+            return (0, 0, 0, 0)
+
+        return (x, y, w, h)
+
+    def split_boxes():
+        segmentID = 0
+
+        for segm in tiles:
+            # For every segm check all objects
+            for box in boxes_list:
+                b_x, b_y, b_w, b_h = intersection_rect(segm, box)
+
+                if b_w > 0 and b_h > 0:
+                    boxes_split.append(Box(b_x, b_y, b_w, b_h, box.cls, segmentID))
+
+            segmentID = segmentID + 1
+
+
+    split_boxes()
+
+    shuffled_ids_copy = copy.deepcopy(shuffled_ids)
+ 
+    while len(shuffled_ids_copy) > 1:
+        segm_1_id = shuffled_ids_copy.pop(0)
+        segm_2_id = shuffled_ids_copy.pop(0)
+
+        change(segm_1_id, segm_2_id)
+
+
+    boxes = np.zeros((len(boxes_split), 5))
+    for i in range(boxes.shape[0]):
+        boxes[i, :] = [
+            # top left point y, x
+            boxes_split[i].x / cols,
+            boxes_split[i].y / rows,
+            # bottom right point y, x
+            (boxes_split[i].x + boxes_split[i].width) / cols,
+            (boxes_split[i].y + boxes_split[i].height) / rows, boxes_split[i].cls
+        ]
+
+    return boxes
+
+def bbox_transpose(bbox, axis, rows, cols):  # skipcq: PYL-W0613
+    """Transposes a bounding box along given axis.
+
+    Args:
+        bbox (tuple): A bounding box `(x_min, y_min, x_max, y_max)`.
+        axis (int): 0 - main axis, 1 - secondary axis.
+        rows (int): Image rows.
+        cols (int): Image cols.
+
+    Returns:
+        tuple: A bounding box tuple `(x_min, y_min, x_max, y_max)`.
+
+    Raises:
+        ValueError: If axis not equal to 0 or 1.
+
+    """
+    x_min, y_min, x_max, y_max = bbox[:4]
+    if axis not in {0, 1}:
+        raise ValueError("Axis must be either 0 or 1.")
+    if axis == 0:
+        bbox = (y_min, x_min, y_max, x_max)
+    if axis == 1:
+        bbox = (1 - y_max, 1 - x_max, 1 - y_min, 1 - x_min)
+    return bbox
+
+
+@angle_2pi_range
+def keypoint_vflip(keypoint, rows, cols):
+    """Flip a keypoint vertically around the x-axis.
+
+    Args:
+        keypoint (tuple): A keypoint `(x, y, angle, scale)`.
+        rows (int): Image height.
+        cols( int): Image width.
+
+    Returns:
+        tuple: A keypoint `(x, y, angle, scale)`.
+
+    """
+    x, y, angle, scale = keypoint
+    angle = -angle
+    return x, (rows - 1) - y, angle, scale
+
+
+@angle_2pi_range
+def keypoint_hflip(keypoint, rows, cols):
+    """Flip a keypoint horizontally around the y-axis.
+
+    Args:
+        keypoint (tuple): A keypoint `(x, y, angle, scale)`.
+        rows (int): Image height.
+        cols (int): Image width.
+
+    Returns:
+        tuple: A keypoint `(x, y, angle, scale)`.
+
+    """
+    x, y, angle, scale = keypoint
+    angle = math.pi - angle
+    return (cols - 1) - x, y, angle, scale
+
+
+def keypoint_flip(keypoint, d, rows, cols):
+    """Flip a keypoint either vertically, horizontally or both depending on the value of `d`.
+
+    Args:
+        keypoint (tuple): A keypoint `(x, y, angle, scale)`.
+        d (int): Number of flip. Must be -1, 0 or 1:
+            * 0 - vertical flip,
+            * 1 - horizontal flip,
+            * -1 - vertical and horizontal flip.
+        rows (int): Image height.
+        cols (int): Image width.
+
+    Returns:
+        tuple: A keypoint `(x, y, angle, scale)`.
+
+    Raises:
+        ValueError: if value of `d` is not -1, 0 or 1.
+
+    """
+    if d == 0:
+        keypoint = keypoint_vflip(keypoint, rows, cols)
+    elif d == 1:
+        keypoint = keypoint_hflip(keypoint, rows, cols)
+    elif d == -1:
+        keypoint = keypoint_hflip(keypoint, rows, cols)
+        keypoint = keypoint_vflip(keypoint, rows, cols)
+    else:
+        raise ValueError("Invalid d value {}. Valid values are -1, 0 and 1".format(d))
+    return keypoint
+
+
 def noop(input_obj, **params):  # skipcq: PYL-W0613
     return input_obj
 
@@ -1147,6 +1420,192 @@ def swap_tiles_on_image(image, tiles):
         ]
 
     return new_image
+
+
+def segment(img, ratio, numberOfRectangles, refinementSteps):
+    """Partition image into uneven blocks.
+
+    Args:
+        img (np.ndarray): Input image.
+        refIter (int): Number of refiment iterations.
+        ratio (float): What ratio the rectangle should have.
+        refinementSteps (int): how many invalid attempts can happen before forced end.
+
+    Returns:
+        list: list of blocks [leftup.y, leftup.x, rightbottom.y, rightbottom.x]
+    """
+
+    # TODO: change the structure to the list
+    @dataclass
+    class Rect:
+        x: float
+        y: float
+        width: float
+        height: float
+
+    imageHeight, imageWidth = img.shape[:2]
+    # minimal side of the rectangle
+    minSide = round(min(imageWidth, imageHeight) / 6)
+    tolerance = ratio * 0.20  # tolerance for the ratio above 20 %
+    rects = []
+
+    def Split(horizontal, index, rects, minSide):
+        """TODO: Pavel should write the docstring
+
+        Args:
+            horizontal ([type]): [description]
+            index ([type]): [description]
+            rects ([type]): [description]
+            minSide ([type]): [description]
+
+        Returns:
+            [type]: [description]
+        """
+        if rects[index].height < 2 * minSide + 1 and rects[index].width < 2 * minSide + 1:
+            return False
+
+        if (rects[index].height < 2 * minSide + 1 and horizontal) or (
+            rects[index].width < 2 * minSide + 1 and not horizontal
+        ):
+            horizontal = not horizontal
+
+        newRect = copy.copy(rects[index])
+
+        if horizontal:
+            newHeight = random.randint(minSide, rects[index].height - minSide)
+
+            newRect.y = rects[index].y + newHeight
+            newRect.height = rects[index].height - newHeight
+
+            if newRect.height < minSide:
+                return False
+
+            rects[index].height = newHeight
+        else:
+            newWidth = random.randint(minSide, rects[index].width - minSide)
+
+            newRect.x = rects[index].x + newWidth
+            newRect.width = rects[index].width - newWidth
+
+            if newRect.width < minSide:
+                return False
+
+            rects[index].width = newWidth
+
+        # Add new rect to the list
+        rects.append(newRect)
+
+        return True
+
+    # Refinement the rectangles to look more like the demanded ratio considering tolerance and prevent stretches
+    def Refinement(rects, ratio, tolerance, minSide):
+        """TODO: Pavel should write the docstring
+
+        Args:
+            rects ([type]): [description]
+            ratio ([type]): [description]
+            tolerance ([type]): [description]
+            minSide ([type]): [description]
+
+        Returns:
+            [type]: [description]
+        """
+        atLeastOneInvalid = False
+        index = 0
+
+        # We must work with the copy because "Split" alters the original list
+        rectsCopy = rects.copy()
+
+        for rect in rectsCopy:
+            # Check validity
+            currentRatio = max(rect.width, rect.height) / min(rect.width, rect.height)
+
+            if currentRatio > ratio + tolerance or currentRatio < ratio - tolerance:
+                atLeastOneInvalid = True
+
+                if rect.height > rect.width:  # tall
+                    Split(True, index, rects, minSide)
+                else:  # thick
+                    Split(False, index, rects, minSide)
+
+            index = index + 1
+
+        return atLeastOneInvalid
+
+    rects.append(Rect(0, 0, imageWidth, imageHeight))
+    # Split
+    currentNumberOfRectangles = 1
+
+    while currentNumberOfRectangles < numberOfRectangles:
+        if Split(bool(random.getrandbits(1)), random.randint(0, len(rects) - 1), rects, minSide):
+            currentNumberOfRectangles = currentNumberOfRectangles + 1
+
+    currentRefinement = 0
+
+    while currentRefinement < refinementSteps:
+        if not Refinement(rects, ratio, tolerance, minSide):
+            break
+        else:
+            currentRefinement = currentRefinement + 1
+
+    rects = [[int(rect.y), int(rect.x), int(rect.y + rect.height), int(rect.x + rect.width)] for rect in rects]
+    return rects
+
+
+def unprop_swap_tiles_on_image(image, tiles, shuffled_ids):
+    """Partition image into uneven blocks, shuffle them and re-assemble the image again.
+
+    Args:
+        img ([np.ndarray, list, tuple]): Input image, or list/tuple of images (expecting image and semantic label).
+        refIter (int): Number of refinement repetetions.
+        ratio (float): Block ratio during division.
+        numberOfRectangles (int): Number of starting rectangles.
+        refinementSteps (int): Number of refinement steps in one iteration.
+
+    Returns:
+        np.ndarray: Unproportionally shuffled image.
+    """
+
+    while len(shuffled_ids) > 1:
+        segm_1_id = shuffled_ids.pop(0)
+        segm_2_id = shuffled_ids.pop(0)
+
+        segm_1 = tiles[segm_1_id]
+        segm_2 = tiles[segm_2_id]
+
+        # 0 => x, 1 => y, 2 => width, 3 => height
+        segm_1_patch = image[segm_1[1]:segm_1[1] + segm_1[3], segm_1[0]:segm_1[0] + segm_1[2], :]
+        segm_1_patch = cv2.resize(segm_1_patch, (segm_2[2], segm_2[3]), interpolation=cv2.INTER_CUBIC)
+
+        segm_2_patch = image[segm_2[1]:segm_2[1] + segm_2[3], segm_2[0]:segm_2[0] + segm_2[2], :]
+        segm_2_patch = cv2.resize(segm_2_patch, (segm_1[2], segm_1[3]), interpolation=cv2.INTER_CUBIC)
+
+        # Insert segm 1 patch into segm 2
+        image[segm_2[1]:segm_2[1] + segm_2[3], segm_2[0]:segm_2[0] + segm_2[2], :] = segm_1_patch
+        # Insert segm 2 patch into segm 1
+        image[segm_1[1]:segm_1[1] + segm_1[3], segm_1[0]:segm_1[0] + segm_1[2], :] = segm_2_patch
+
+    return image
+
+
+def keypoint_transpose(keypoint):
+    """Rotate a keypoint by angle.
+
+    Args:
+        keypoint (tuple): A keypoint `(x, y, angle, scale)`.
+
+    Returns:
+        tuple: A keypoint `(x, y, angle, scale)`.
+
+    """
+    x, y, angle, scale = keypoint[:4]
+
+    if angle <= np.pi:
+        angle = np.pi - angle
+    else:
+        angle = 3 * np.pi - angle
+
+    return y, x, angle, scale
 
 
 @clipped
